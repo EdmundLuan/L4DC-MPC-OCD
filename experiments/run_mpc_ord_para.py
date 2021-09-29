@@ -1,15 +1,13 @@
-
-from multiprocessing import Pool
-import multiprocessing
-
 from argparse import ArgumentParser
-
+from pathos.multiprocessing import ProcessPool as Pool
+from multiprocess import context as ctx
 from PIL.Image import init
-from interact_drive.reward_design.mpc_ord import finite_horizon_env
+from interact_drive.reward_design.mpc_ord_para import finite_horizon_env
 from experiments.local_opt_scenario import local_opt_env
 from experiments.replanning_world import setup_world as replanning_env
 import numpy as np
-from interact_drive.reward_design.mpc_ord import MPC_ORD
+import tensorflow as tf
+from interact_drive.reward_design.mpc_ord_para import MPC_ORD
 
 
 def fmt(arr):
@@ -44,7 +42,7 @@ envs = {
 		'tuned_weights': np.array([-0.55899817 ,-0.4436692, -0.3724511 ,-0.19964276, -0.5438697, 0.12770043])
 	}, 
 }
-def main():
+def main(n_parallel):
 	parser = ArgumentParser()
 	parser.add_argument('scenario', type=str, choices=['local_opt', 'finite_horizon', 'replanning'],
 	                    help='Which scenario to run reward weight optimization for.')
@@ -84,29 +82,28 @@ def main():
 
 	init_states_groups = [[s] for s in init_states] if args.one_by_one else [init_states]
 
-	if len(init_states_groups) > 1:
-		n_parallel = len(init_states_groups)
-		# n_parallel = multiprocessing.cpu_count()
-		with Pool(n_parallel) as pool:
-			print('\n\nRunning ', n_parallel, ' tasks in parallel... ')
-			pool.map(run_opt, zip([env]*len(init_states_groups), 
-				init_states_groups, 
-				[args]*len(init_states_groups), 
-				[optimization_seed for i in range(len(init_states_groups))]
-			))
-	else:
-		run_opt((env, init_states, args, optimization_seed))
+	# if len(init_states_groups) > 1:
+	# 	n_parallel = len(init_states_groups)
+	# 	with Pool(n_parallel) as pool:
+	# 		print('\n\nRunning ', n_parallel, ' tasks in parallel... ')
+	# 		pool.map(run_opt, zip([env]*len(init_states_groups), 
+	# 			init_states_groups, 
+	# 			[args]*len(init_states_groups), 
+	# 			[optimization_seed for i in range(len(init_states_groups))]
+	# 		))
+	# else:
+	run_opt((env, init_states, args, optimization_seed, n_parallel))
 
 
 def run_opt(_):
-	env, init_states, args, optimization_seed = _
+	env, init_states, args, optimization_seed, batch_sz= _
 
 	print("\n*****************\n\tOPTIMIZING REWARD FROM INIT STATES", init_states, '\n*****************')
 
 	car, world, _ = env['make_env'](debug=True)
 
 	mpc_ord = MPC_ORD(world, car,
-				   init_states, env['eval_horizon'], num_samples=env['num_eval_samples'],
+				   init_states, env['eval_horizon'], batch_sz, num_samples=env['num_eval_samples'],
 				   save_path=f'{args.optimizer}_{args.scenario}__designer_weights_{fmt(car.weights)}__{args.n_inits if not args.one_by_one else fmt(init_states[0])}_init_seed_{args.seed}_opt_seed_{optimization_seed}_sigma_{args.sigma}.pkl', )
 
 	# if args.optimizer == 'bayesopt':
@@ -132,6 +129,44 @@ def run_opt(_):
 
 
 if __name__ == '__main__':
-	multiprocessing.set_start_method('spawn') 
-	# multiprocessing.set_start_method('forkserver') 
-	main()
+	# gpus = tf.config.experimental.list_physical_devices('GPU')
+	n_parallel = eval(input("n_parallel = "))
+	if n_parallel <= 0:
+		n_parallel = 1
+	# if gpus:
+	# 	# Restrict TensorFlow to only allocate 1GB of memory on the first GPU
+	# 	try:
+	# 		total_gpu_mem = 5120
+	# 		tf.config.experimental.set_virtual_device_configuration(
+	# 			gpus[0],
+	# 			[
+	# 				tf.config.experimental.VirtualDeviceConfiguration(memory_limit=total_gpu_mem/n_parallel) 
+	# 			]*n_parallel
+	# 		)
+	# 		logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+	# 		print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+	# 	except RuntimeError as e:
+	# 		# Virtual devices must be set before GPUs have been initialized
+	# 		print(e)
+	gpus = tf.config.list_physical_devices('GPU')
+	try:
+		total_gpu_mem = 5120
+		tf.config.set_logical_device_configuration(
+			gpus[0],
+			[tf.config.LogicalDeviceConfiguration(memory_limit=total_gpu_mem/n_parallel)]*n_parallel
+		)
+
+		logical_devices = tf.config.list_logical_devices('GPU')
+		assert len(logical_devices) == len(gpus) + 1
+		# for i in range(len(logical_devices)):
+		# 	tf.config.experimental.set_memory_growth(logical_devices[i], False)
+	except:
+		# Invalid device or cannot modify logical devices once initialized.
+		pass
+	gpus = tf.config.list_logical_devices('GPU')
+	print('\n\n****',gpus)
+
+	input('GPU set, holding. Press Enter to continue... ')
+
+	ctx._force_start_method('spawn')	# setting context for parallel 
+	main(n_parallel)

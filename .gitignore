@@ -1,5 +1,6 @@
-*.png
+# *.png
 *.pkl
+*.bak
 *.gif
 # Python files
 *.pyc

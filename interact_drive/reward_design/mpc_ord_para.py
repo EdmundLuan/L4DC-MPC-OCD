@@ -1,7 +1,10 @@
+from multiprocessing import spawn
 from experiments.merging import ThreeLaneCarWorld, ThreeLaneTestCar
 from interact_drive.car import FixedVelocityCar
-# from pathos.multiprocessing import ProcessingPool as Pool
-from multiprocessing import Pool
+from pathos.multiprocessing import ProcessPool as Pool
+from multiprocess import context as ctx
+# from multiprocessing import Pool
+import multiprocessing
 import numpy as np
 import tensorflow as tf
 import time
@@ -14,11 +17,11 @@ class list2(list): # hack to make a mutable list type in python
 	def __init__(self, *args, **kwargs):
 		super().__init__(self, *args, **kwargs)
 
-
 class MPC_ORD:
-	def __init__(self, world, car, init_car_states, designer_horizon, save_path=None, num_samples=1):
-		self.world = world
-		self.car = car
+	def __init__(self, world, car, init_car_states, designer_horizon, batch_sz=1, save_path=None, num_samples=1):
+		self.batch_sz = batch_sz if batch_sz>= 1 else 1
+		self.worlds = [world]*self.batch_sz
+		self.cars = [car]*self.batch_sz
 
 		self.designer_horizon = designer_horizon
 		self.init_car_states = init_car_states
@@ -27,6 +30,7 @@ class MPC_ORD:
 		self.designer_weights = car.weights/np.linalg.norm(car.weights)
 		self.weight_dim = len(car.weights)
 
+		self.zero_time = time.time()
 		self.history = list2()
 		self.iter = 0
 		self.should_save_history = False
@@ -40,7 +44,7 @@ class MPC_ORD:
 		self.should_save_history = True
 
 		self.eval_weights(self.designer_weights)
-
+		
 		print('Start optimizing...')
 
 		x, es = cma.evolution_strategy.fmin2(self.eval_weights, list(self.designer_weights), sigma0=sigma0, options={'seed': seed})
@@ -70,45 +74,46 @@ class MPC_ORD:
 		self.done = True
 		return max(self.history, key=lambda a: a[1])
 
-	def eval_weights_for_init(self, init, weights, render, heatmap_show=False):
+	def eval_weights_for_init(self, _):
 		# evaluates weights for a single initialization
-		if weights.ndim ==  2:
-			weights = weights[0] # reshape 2d array with one row into 1d array
-		weights = weights/np.linalg.norm(weights)
-
-		if self.car.debug:
-			for car in self.world.cars:
-				assert car.debug
-
-		frames = []
-		def maybe_render():
-			if render:
-				frames.append(self.world.render("rgb_array", heatmap_show=heatmap_show))
 		
+		world, car, init, weights, render, heatmap_show, gpu = _
+		with tf.device(gpu.name):
+			if weights.ndim ==  2:
+				weights = weights[0] # reshape 2d array with one row into 1d array
+			weights = weights/np.linalg.norm(weights)
+			if car.debug:
+				for car_ in world.cars:
+					assert car_.debug
 
-		self.car.weights = weights
-		self.car.init_state = tf.constant(init, dtype=tf.float32)
+			frames = []
+			def maybe_render():
+				if render:
+					frames.append(self.world.render("rgb_array", heatmap_show=heatmap_show))
+			
+			car.weights = weights
+			car.init_state = tf.constant(init, dtype=tf.float32)
 
-		designer_reward = 0
-		for _ in range(self.num_samples):
+			designer_reward = 0
+			for _ in range(self.num_samples):
 
-			self.world.reset()
-			#if not self.car.debug:
-			maybe_render()
-
-			sample_reward = 0
-
-			for i in range(self.designer_horizon):
-				past_state, controls, state = self.world.step()
+				world.reset()
 				#if not self.car.debug:
 				maybe_render()
-				sample_reward += self.car.reward_fn(past_state, controls[self.car.index], weights=self.designer_weights)
-			#if self.car.debug:
-			#	maybe_render()
-			designer_reward += sample_reward
-			print('sample_reward',sample_reward)
-		designer_reward = designer_reward.numpy()
-		print('init', init, 'weights', weights ,'\tgave return:',designer_reward, 'time',time.time())
+
+				sample_reward = 0
+
+				for i in range(self.designer_horizon):
+					past_state, controls, state = world.step()
+					#if not car.debug:
+					maybe_render()
+					sample_reward += car.reward_fn(past_state, controls[car.index], weights=self.designer_weights)
+				#if car.debug:
+				#	maybe_render()
+				designer_reward += sample_reward
+				print('sample_reward',sample_reward)
+			designer_reward = designer_reward.numpy()
+			print('init', init, '\nweights', weights ,'\n\tgave return:',designer_reward, '\ntime',time.time()-self.zero_time)
 		return (designer_reward, frames) if render else designer_reward
 
 
@@ -133,34 +138,68 @@ class MPC_ORD:
 		total_designer_reward = 0
 		frames = []
 
-		# # Parallel processing, but doesn't work
-		# with Pool(len(self.init_car_states)) as pool:
-		# 	rets = pool.map(self.eval_weights_for_init, 
-		# 				zip(
-		# 					self.init_car_states, 
-		# 					[weights]*len(self.init_car_states),
-		# 					[gif is not None]*len(self.init_car_states), 
-		# 					[heatmap_show]*len(self.init_car_states)
-		# 				)
-		# 			)
-		# if gif:
-		# 	rewrds, frames = rets
-		# if len(self.init_car_states)>1:
-		# 	print('\t rewards from init states: ', rewrds)
+		## Parallel processing, but doesn't work
+		# n_parallel = 4
+		# n_parallel = multiprocessing.cpu_count()
+		# n_parallel = self.n_parallel
+		# gpus = tf.config.experimental.list_physical_devices('GPU')
+		# if gpus:
+		# 	# Restrict TensorFlow to only allocate 1GB of memory on the first GPU
+		# 	try:
+		# 		total_gpu_mem = 5120
+		# 		tf.config.experimental.set_virtual_device_configuration(
+		# 			gpus[0],
+		# 			[
+		# 				tf.config.experimental.VirtualDeviceConfiguration(memory_limit=total_gpu_mem/self.batch_sz) 
+		# 			]*self.batch_sz
+		# 		)
+		# 		logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+		# 		print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+		# 	except RuntimeError as e:
+		# 		# Virtual devices must be set before GPUs have been initialized
+		# 		print(e)
+		# input('Holding...')
+		tf.debugging.set_log_device_placement(True)
+		gpus = tf.config.experimental.list_logical_devices('GPU')
+		with Pool(self.batch_sz) as pool:
+			print('Evaluating ', self.batch_sz, ' trajectories in parallel...')
+			# print(self.worlds,
+			# 	self.cars,
+			# 	self.init_car_states, 
+			# 	[weights]*self.batch_sz,
+			# 	[gif is not None]*self.batch_sz, 
+			# 	[heatmap_show]*self.batch_sz)
+			ret = pool.map(self.eval_weights_for_init , 
+						zip(
+							self.worlds,
+							self.cars,
+							self.init_car_states, 
+							[weights]*self.batch_sz,
+							[gif is not None]*self.batch_sz, 
+							[heatmap_show]*self.batch_sz, 
+							gpus
+						)
+					)
+		if gif:
+			rewrds, frames = ret
+		else:
+			rewrds = ret
+		if self.batch_sz>1:
+			print('\t rewards from init states: ', rewrds)
 		
 		# total_designer_reward += sum(rewrds)
 
 		# Serial processing
-		for init_car_state in self.init_car_states:
+		# for init_car_state in self.init_car_states:
 
-			r = self.eval_weights_for_init(init_car_state, weights, gif is not None, heatmap_show=heatmap_show)
-			if gif:
-				r, frames_from_init = r
-				frames.extend(frames_from_init)
+		# 	r = self.eval_weights_for_init(init_car_state, weights, gif is not None, heatmap_show=heatmap_show)
+		# 	if gif:
+		# 		r, frames_from_init = r
+		# 		frames.extend(frames_from_init)
 
-			if len(self.init_car_states) > 1:
-				print('\tinit_reward',r)
-			total_designer_reward += r
+		# 	if len(self.init_car_states) > 1:
+		# 		print('\tinit_reward',r)
+		# 	total_designer_reward += r
 
 		total_designer_reward /= self.num_samples
 		print('eval reward for weights:',total_designer_reward,'\n\n')

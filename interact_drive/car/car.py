@@ -49,6 +49,7 @@ class Car(object):
                     CarWorld associated with this car.
             debug: a debug flag. If true, we log the past trajectory of the car.
         """
+
         self.env = env
         self.friction = friction
         self.dynamics_fn = get_dynamics_fn(tf.constant(friction))
